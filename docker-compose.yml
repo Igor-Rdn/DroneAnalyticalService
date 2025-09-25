@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: my-mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: secret123
+    volumes:
+      - ./data/mongo:/data/db
+
+  app:
+    image: fortur/backend:latest
+    container_name: my-go-app
+    restart: always
+    depends_on:
+      - mongo
+    environment:
+      MONGO_URI: mongodb://admin:secret123@mongo:27017
+    ports:
+      - "8080:8080"
