@@ -11,27 +11,31 @@ import (
 )
 
 // Подключение к MongoDB
-func ConnectToMongoDB() (collection *mongo.Collection) {
-	var mongoClient *mongo.Client
+func ConnectToMongoDB() *mongo.Client {
 
 	uri := os.Getenv("MONGO_URI")
+	if uri == "" {
+		uri = "mongodb://admin:secret123@localhost:27017/"
+	}
 
 	clientOptions := options.Client().ApplyURI(uri)
 
-	var err error
-	mongoClient, err = mongo.Connect(context.Background(), clientOptions)
+	client, err := mongo.Connect(context.Background(), clientOptions)
 	if err != nil {
 		log.Fatal("❌ Ошибка подключения к MongoDB:", err)
 	}
 
 	// Проверяем подключение
-	err = mongoClient.Ping(context.Background(), nil)
+	err = client.Ping(context.Background(), nil)
 	if err != nil {
 		log.Fatal("❌ MongoDB не доступна:", err)
 	}
 
 	fmt.Println("✅ Успешное подключение к MongoDB")
+	return client
+}
 
-	// Создаем/получаем коллекцию
-	return mongoClient.Database("admin").Collection("flightData")
+// GetCollection возвращает коллекцию по имени
+func GetCollection(client *mongo.Client, databaseName, collectionName string) *mongo.Collection {
+	return client.Database(databaseName).Collection(collectionName)
 }
