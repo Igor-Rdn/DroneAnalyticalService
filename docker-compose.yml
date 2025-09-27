@@ -10,16 +10,31 @@ services:
     environment:
       MONGO_INITDB_ROOT_USERNAME: admin
       MONGO_INITDB_ROOT_PASSWORD: secret123
-    volumes:
-      - ./data/mongo:/data/db
+   #volumes:
+   #  - ./data/mongo:/data/db
 
-  app:
-    image: fortur/backend:latest
-    container_name: my-go-app
-    restart: always
-    depends_on:
-      - mongo
+#  app:
+#    build: .
+#    container_name: my-go-app
+#    restart: always
+#    depends_on:
+#      - mongo
+#      - keycloak
+#    environment:
+#      MONGO_URI: mongodb://admin:secret123@mongo:27017
+#      KEYCLOAK_URL: http://keycloak:8080/realms/drones-monitor
+#      FRONT_URL: http://localhost:5173
+#    ports:
+#      - "8080:8080"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.4
+    container_name: keycloak
+    command: start-dev --import-realm
     environment:
-      MONGO_URI: mongodb://admin:secret123@mongo:27017
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin123
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
     ports:
-      - "8080:8080"
+      - "8081:8080"

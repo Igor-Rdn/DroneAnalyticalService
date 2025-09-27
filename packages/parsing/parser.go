@@ -2,7 +2,12 @@ package parsing
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
+
+	coorinates "project/packages/parsing/coordinates"
+	"project/packages/parsing/datetime"
 )
 
 type FlightData struct {
@@ -23,45 +28,45 @@ type FlightData struct {
 
 // SHRData - данные из столбца B (основная информация о полете)
 type SHRData struct {
-	RawText          string `bson:"rawText" json:"rawText"`
-	SID              string `bson:"sid" json:"sid"`
-	AircraftIndex    string `bson:"aircraftIndex" json:"aircraftIndex"`
-	AircraftType     string `bson:"aircraftType" json:"aircraftType"`
-	AircraftQuantity string `bson:"aircraftQuantity" json:"aircraftQuantity"`
-	CoordinatesDep   string `bson:"coordinatesDep" json:"coordinatesDep"`
-	CoordinatesArr   string `bson:"coordinatesArr" json:"coordinatesArr"`
-	Date             string `bson:"date" json:"date"`
-	Operator         string `bson:"operator" json:"operator"`
-	Remarks          string `bson:"remarks" json:"remarks"`
+	RawText          string                 `bson:"rawText" json:"rawText"`
+	SID              *int                   `bson:"sid" json:"sid"`
+	AircraftIndex    string                 `bson:"aircraftIndex" json:"aircraftIndex"`
+	AircraftType     string                 `bson:"aircraftType" json:"aircraftType"`
+	AircraftQuantity string                 `bson:"aircraftQuantity" json:"aircraftQuantity"`
+	CoordinatesDep   *coorinates.Coordinate `bson:"coordinatesDep,omitempty" json:"coordinatesDep"`
+	CoordinatesArr   *coorinates.Coordinate `bson:"coordinatesArr,omitempty" json:"coordinatesArr"`
+	DateTime         *time.Time             `bson:"dateTime" json:"dateTime"`
+	Operator         string                 `bson:"operator" json:"operator"`
+	Remarks          string                 `bson:"remarks" json:"remarks"`
 }
 
 // DepartureData - данные о вылете из столбца C
 type DepartureData struct {
-	RawText     string `bson:"rawText" json:"rawText"`
-	SID         string `bson:"sid" json:"sid"`
-	Date        string `bson:"date" json:"date"`
-	Time        string `bson:"time" json:"time"`
-	Airport     string `bson:"airport" json:"airport"`
-	Coordinates string `bson:"coordinates" json:"coordinates"`
+	RawText     string                 `bson:"rawText" json:"rawText"`
+	SID         *int                   `bson:"sid" json:"sid"`
+	DateTime    *time.Time             `bson:"dateTime" json:"dateTime"`
+	Airport     string                 `bson:"airport" json:"airport"`
+	Coordinates *coorinates.Coordinate `bson:"coordinates,omitempty" json:"coordinates"`
+	//Time        string                 `bson:"time" json:"time"`
 }
 
 // ArrivalData - данные о прибытии из столбца D
 type ArrivalData struct {
-	RawText     string `bson:"rawText" json:"rawText"`
-	SID         string `bson:"sid" json:"sid"`
-	Date        string `bson:"date" json:"date"`
-	Time        string `bson:"time" json:"time"`
-	Airport     string `bson:"airport" json:"airport"`
-	Coordinates string `bson:"coordinates" json:"coordinates"`
+	RawText     string                 `bson:"rawText" json:"rawText"`
+	SID         *int                   `bson:"sid" json:"sid"`
+	DateTime    *time.Time             `bson:"dateTime" json:"dateTime"`
+	Airport     string                 `bson:"airport" json:"airport"`
+	Coordinates *coorinates.Coordinate `bson:"coordinates,omitempty" json:"coordinates"`
+	//Time        string                 `bson:"time" json:"time"`
 }
 
 // KeyFields - ключевые поля для индексации и поиска
 type SearchField struct {
-	SID         string `bson:"sid" json:"sid"`
-	Region      string `bson:"region" json:"region"`
-	Date        string `bson:"date" json:"date"`
-	Operator    string `bson:"operator" json:"operator"`
-	Coordinates string `bson:"coordinates" json:"coordinates"`
+	SID         *int                   `bson:"sid" json:"sid"`
+	Region      string                 `bson:"region" json:"region"`
+	DateTime    *time.Time             `bson:"dateTime" json:"dateTime"`
+	Operator    string                 `bson:"operator" json:"operator"`
+	Coordinates *coorinates.Coordinate `bson:"coordinates,omitempty" json:"coordinates"`
 }
 
 // Безопасное получение элемента из массива
@@ -70,6 +75,16 @@ func safeGet(arr []string, index int) string {
 		return arr[index]
 	}
 	return ""
+}
+
+func parseInt(s string) *int {
+	if s == "" {
+		return nil
+	}
+	if val, err := strconv.Atoi(s); err == nil {
+		return &val
+	}
+	return nil
 }
 
 // Создание структуры FlightData из строки Excel
@@ -87,7 +102,7 @@ func CreateFlightData(rowNum int, row []string) FlightData {
 	// Создаем ключевые поля для индексации
 	searchField := SearchField{
 		Region:   region,
-		Date:     shrData.Date,
+		DateTime: shrData.DateTime,
 		Operator: shrData.Operator,
 		SID:      shrData.SID,
 	}
@@ -119,10 +134,10 @@ func parseSHRData(rawText string) SHRData {
 	shr.AircraftIndex = extractData(`SHR-([A-Z0-9]+)`, rawText)
 	shr.AircraftType = extractData(`TYP/\d*([A-Z]+)`, rawText)
 	shr.AircraftQuantity = extractData(`TYP/([0-9]+)`, rawText)
-	shr.CoordinatesDep = extractData(`DEP/([0-9]+[NS][0-9]+[EW])`, rawText)
-	shr.CoordinatesArr = extractData(`DEST/([0-9]+[NS][0-9]+[EW])`, rawText)
-	shr.Date = extractData(`DOF/([0-9]+)`, rawText)
-	shr.SID = extractData(`SID/([0-9]+)`, rawText)
+	shr.CoordinatesDep, _ = coorinates.ParseAviationCoordinate(extractData(`DEP/([0-9]+[NS][0-9]+[EW])`, rawText))
+	shr.CoordinatesArr, _ = coorinates.ParseAviationCoordinate(extractData(`DEST/([0-9]+[NS][0-9]+[EW])`, rawText))
+	shr.DateTime = datetime.ParseDate(extractData(`DOF/([0-9]+)`, rawText), "")
+	shr.SID = parseInt(extractData(`SID/([0-9]+)`, rawText))
 
 	// Парсинг OPR
 	if idx := strings.Index(rawText, "OPR/"); idx != -1 {
@@ -143,11 +158,11 @@ func parseDepartureData(rawText string) DepartureData {
 		RawText: rawText,
 	}
 
-	dep.SID = extractData(`-SID ([0-9]+)`, rawText)
-	dep.Date = extractData(`-ADD ([0-9]+)`, rawText)
-	dep.Time = extractData(`-ATD ([0-9]+)`, rawText)
+	dep.SID = parseInt(extractData(`-SID ([0-9]+)`, rawText))
+	dep.DateTime = datetime.ParseDate(extractData(`-ADD ([0-9]+)`, rawText), extractData(`-ATD ([0-9]+)`, rawText))
+	//dep.Time = extractData(`-ATD ([0-9]+)`, rawText)
 	dep.Airport = extractData(`-ADEP ([A-Z0-9]+)`, rawText)
-	dep.Coordinates = extractData(`-ADEPZ ([0-9]+[NS][0-9]+[EW])`, rawText)
+	dep.Coordinates, _ = coorinates.ParseAviationCoordinate(extractData(`-ADEPZ ([0-9]+[NS][0-9]+[EW])`, rawText))
 
 	return dep
 }
@@ -158,11 +173,11 @@ func parseArrivalData(rawText string) ArrivalData {
 		RawText: rawText,
 	}
 
-	arr.SID = extractData(`-SID ([0-9]+)`, rawText)
-	arr.Date = extractData(`-ADA ([0-9]+)`, rawText)
-	arr.Time = extractData(`-ATA ([0-9]+)`, rawText)
+	arr.SID = parseInt(extractData(`-SID ([0-9]+)`, rawText))
+	arr.DateTime = datetime.ParseDate(extractData(`-ADA ([0-9]+)`, rawText), extractData(`-ATA ([0-9]+)`, rawText))
+	//arr.Time = extractData(`-ATA ([0-9]+)`, rawText)
 	arr.Airport = extractData(`-ADARR ([A-Z0-9]+)`, rawText)
-	arr.Coordinates = extractData(`-ADARRZ ([0-9]+[NS][0-9]+[EW])`, rawText)
+	arr.Coordinates, _ = coorinates.ParseAviationCoordinate(extractData(`-ADARRZ ([0-9]+[NS][0-9]+[EW])`, rawText))
 
 	return arr
 }

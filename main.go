@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"net/http"
+
+	"log"
+	"project/packages/auth"
+	"project/packages/cors"
 	"project/packages/handlers"
 	"project/packages/mongodb"
 
@@ -15,10 +19,25 @@ func main() {
 	client := mongodb.ConnectToMongoDB()
 	defer client.Disconnect(context.Background())
 
+	//Инициализация роутера
 	router := gin.Default()
+
+	//Проверка допустимых доменов
+	router.Use(cors.CORS())
+
+	router.OPTIONS("/*path", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	//Авторизация
+	router.Use(auth.JWTAuth())
 
 	handlers.RegisterRoutes(router, client)
 
-	router.Run(":8080")
-	fmt.Println("🚀 Сервер запущен на http://localhost:8080")
+	port := ":8080"
+
+	if err := router.Run(port); err != nil {
+		log.Fatal("❌ Ошибка запуска сервера:", err)
+	}
+
 }

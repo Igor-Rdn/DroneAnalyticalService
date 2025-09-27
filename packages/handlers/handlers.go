@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"project/packages/auth"
 	"project/packages/mongodb"
 	"project/packages/parsing"
 
@@ -15,28 +17,122 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+type useTables struct {
+	flightDataCollection *mongo.Collection
+	regionListCollection *mongo.Collection
+}
+
 func RegisterRoutes(r *gin.Engine, client *mongo.Client) {
 
+	var tables = useTables{
+		mongodb.GetCollection(client, "admin", "flightData"),
+		mongodb.GetCollection(client, "admin", "regionList"),
+	}
+
 	r.GET("/ping", healthCheck)
+	r.GET("/regions", func(c *gin.Context) { getRegionList(c, tables) })
+	r.GET("/heatmap", func(c *gin.Context) { getHeatmapData(c, tables) })
 
-	r.POST("/upload", func(c *gin.Context) {
-
-		flightDataCollection := mongodb.GetCollection(client, "admin", "flightData")
-		regionListCollection := mongodb.GetCollection(client, "admin", "regionList")
-		uploadFiles(c, flightDataCollection)
-		updateRegionList(flightDataCollection, regionListCollection)
-	})
-
-	r.GET("/regions", func(c *gin.Context) {
-		collection := mongodb.GetCollection(client, "admin", "regionList")
-		getRegionList(c, collection)
-
+	r.POST("/upload", auth.RequireRealmRole("admin"), func(c *gin.Context) {
+		uploadFiles(c, tables)
+		updateRegionList(tables)
 	})
 
 }
 
+// Запрос для тепловой карты полетов
+func getHeatmapData(c *gin.Context, collection useTables) {
+	flightDataCollection := collection.flightDataCollection
+
+	// Декодируем параметр region из URL
+	regionEncoded := c.Query("region")
+	region, err := url.QueryUnescape(regionEncoded)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Ошибка декодирования параметра region"})
+		return
+	}
+
+	if region == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Параметр region обязателен"})
+		return
+	}
+
+	ctx := context.Background()
+
+	cursor, err := flightDataCollection.Find(ctx, bson.M{"region": region})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка выполнения запроса к базе данных"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var results []bson.M
+	if err := cursor.All(ctx, &results); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка декодирования данных"})
+		return
+	}
+
+	var coordinates []map[string]float64
+	var noFoundCounter int
+	for _, result := range results {
+		var lat, lng float64
+		found := false
+
+		// Пытаемся получить координаты из dep->coordinates (как объект с lat/lon)
+		if dep, ok := result["dep"].(bson.M); ok {
+			if coords, ok := dep["coordinates"].(bson.M); ok {
+				if latVal, ok := coords["lat"].(float64); ok {
+					lat = latVal
+				}
+				if lngVal, ok := coords["lon"].(float64); ok { // Обратите внимание: "lon", а не "lng"
+					lng = lngVal
+				}
+				if lat != 0 || lng != 0 {
+					found = true
+				}
+			}
+		}
+
+		// Если в dep->coordinates нет данных, пробуем shr->coordinatesDep
+		if !found {
+			if shr, ok := result["shr"].(bson.M); ok {
+				if coordsDep, ok := shr["coordinatesDep"].(bson.M); ok {
+					if latVal, ok := coordsDep["lat"].(float64); ok {
+						lat = latVal
+					}
+					if lngVal, ok := coordsDep["lon"].(float64); ok {
+						lng = lngVal
+					}
+					if lat != 0 || lng != 0 {
+						found = true
+					}
+				}
+			}
+		}
+
+		// Добавляем координаты, если они найдены
+		if found {
+			coordinates = append(coordinates, map[string]float64{
+				"lat": lat,
+				"lng": lng, // Преобразуем lon в lng для ответа
+			})
+		} else {
+			noFoundCounter++
+		}
+	}
+
+	if noFoundCounter > 0 {
+		fmt.Printf("  ❌ Координаты не найдены в документе для %d строк \n", noFoundCounter)
+	}
+
+	c.JSON(http.StatusOK, coordinates)
+}
+
 // Получаем все документы из коллекции regionList
-func getRegionList(c *gin.Context, collection *mongo.Collection) {
+func getRegionList(c *gin.Context, collection useTables) {
+
+	regionListCollection := collection.regionListCollection
+
 	ctx := context.Background()
 
 	// Создаем структуру для ответа
@@ -44,7 +140,7 @@ func getRegionList(c *gin.Context, collection *mongo.Collection) {
 		Region string `bson:"region" json:"region"`
 	}
 
-	cursor, err := collection.Find(ctx, bson.M{})
+	cursor, err := regionListCollection.Find(ctx, bson.M{})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка получения данных из базы"})
 		return
@@ -55,7 +151,7 @@ func getRegionList(c *gin.Context, collection *mongo.Collection) {
 	// Если нужно вернуть только поле region без regionID
 	if len(regions) == 0 {
 		// Альтернативный способ - проекция в запросе
-		cursor, err := collection.Find(ctx, bson.M{}, options.Find().SetProjection(bson.M{"region": 1, "_id": 0}))
+		cursor, err := regionListCollection.Find(ctx, bson.M{}, options.Find().SetProjection(bson.M{"region": 1, "_id": 0}))
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка получения данных из базы"})
 			return
@@ -81,7 +177,9 @@ func healthCheck(c *gin.Context) {
 }
 
 // Парсинг и загрузка файла в базу
-func uploadFiles(c *gin.Context, flightDataCollection *mongo.Collection) {
+func uploadFiles(c *gin.Context, collection useTables) {
+
+	flightDataCollection := collection.flightDataCollection
 
 	fmt.Println("=== НАЧАЛО ОБРАБОТКИ ДАННЫХ ДЛЯ MONGODB ===")
 
@@ -153,7 +251,10 @@ func uploadFiles(c *gin.Context, flightDataCollection *mongo.Collection) {
 }
 
 // Обновляем список уникальных регионов
-func updateRegionList(flightDataCollection *mongo.Collection, regionListCollection *mongo.Collection) {
+func updateRegionList(collection useTables) {
+
+	regionListCollection := collection.regionListCollection
+	flightDataCollection := collection.flightDataCollection
 
 	ctx := context.Background()
 
