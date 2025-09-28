@@ -14,7 +14,8 @@
             "env":{"MONGO_URI":"mongodb://admin:secret123@localhost:27017/", 
             "FRONT_URL":"http://localhost:3000",
             "IS_DEV":"yes",
-            "KEYCLOAK_URL":"http://keycloak:8080/realms/drones-monitor"}
+            "KEYCLOAK_URL":"http://keycloak:8080/realms/drones-monitor",
+            "GIN_MODE":"release"},
         }
     ]
 }

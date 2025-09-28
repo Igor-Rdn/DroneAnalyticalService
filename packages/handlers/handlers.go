@@ -9,6 +9,7 @@ import (
 	"project/packages/auth"
 	"project/packages/mongodb"
 	"project/packages/parsing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/xuri/excelize/v2"
@@ -32,12 +33,293 @@ func RegisterRoutes(r *gin.Engine, client *mongo.Client) {
 	r.GET("/ping", healthCheck)
 	r.GET("/regions", func(c *gin.Context) { getRegionList(c, tables) })
 	r.GET("/heatmap", func(c *gin.Context) { getHeatmapData(c, tables) })
+	r.GET("/flight-count", func(c *gin.Context) { getFlightCount(c, tables) })
+	r.GET("/avg-flight-duration", func(c *gin.Context) { getAvgFlightDuration(c, tables) })
+	r.GET("/top-10", func(c *gin.Context) { getTop10Regions(c, tables) })
 
 	r.POST("/upload", auth.RequireRealmRole("admin"), func(c *gin.Context) {
 		uploadFiles(c, tables)
 		updateRegionList(tables)
 	})
 
+}
+
+func getTop10Regions(c *gin.Context, collection useTables) {
+	flightDataCollection := collection.flightDataCollection
+
+	// Получаем параметры из query string
+	from := c.Query("from")
+	to := c.Query("to")
+
+	if from == "" || to == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Параметры from и to обязательны"})
+		return
+	}
+
+	ctx := context.Background()
+
+	// Парсим даты
+	start, err := time.Parse(time.RFC3339, from)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат from"})
+		return
+	}
+
+	end, err := time.Parse(time.RFC3339, to)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат to"})
+		return
+	}
+
+	fmt.Printf("🏆 Получение топ-10 регионов с %s по %s\n", from, to)
+
+	// Создаем pipeline для агрегации
+	pipeline := mongo.Pipeline{
+		// Фильтруем по searchFields.dateTime
+		{{Key: "$match", Value: bson.M{
+			"searchFields.dateTime": bson.M{
+				"$gte": start,
+				"$lte": end,
+			},
+		}}},
+		// Группируем по регионам, считаем полеты и сумму дронов
+		{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: "$region"},
+			{Key: "flightCount", Value: bson.D{{Key: "$sum", Value: 1}}},
+			{Key: "droneCount", Value: bson.D{
+				{Key: "$sum", Value: bson.D{
+					{Key: "$cond", Value: bson.A{
+						bson.M{"$and": bson.A{
+							bson.M{"$ne": bson.A{"$shr.aircraftQuantity", nil}},
+							bson.M{"$gt": bson.A{"$shr.aircraftQuantity", 0}},
+						}},
+						"$shr.aircraftQuantity",
+						1, // если aircraftQuantity пустое или 0, используем 1
+					}},
+				}},
+			}}},
+		}},
+		// Сортируем по flightCount по убыванию
+		{{Key: "$sort", Value: bson.M{"flightCount": -1}}},
+		// Ограничиваем 10 результатами
+		{{Key: "$limit", Value: 10}},
+		// Проектируем в нужный формат
+		{{Key: "$project", Value: bson.D{
+			{Key: "_id", Value: 0},
+			{Key: "region", Value: "$_id"},
+			{Key: "flightCount", Value: 1},
+			{Key: "droneCount", Value: 1},
+		}}},
+	}
+
+	cursor, err := flightDataCollection.Aggregate(ctx, pipeline)
+	if err != nil {
+		fmt.Printf("❌ Ошибка агрегации: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка выполнения запроса к базе данных"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var results []bson.M
+	if err := cursor.All(ctx, &results); err != nil {
+		fmt.Printf("❌ Ошибка декодирования: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка декодирования данных"})
+		return
+	}
+
+	fmt.Printf("📈 Найдено регионов в топ-10: %d\n", len(results))
+
+	/* 	// Выводим результаты для отладки
+	   	for i, result := range results {
+	   		fmt.Printf("🏅 %d. Регион: %s, полетов: %v, дронов: %v\n",
+	   			i+1, result["region"], result["flightCount"], result["droneCount"])
+	   	} */
+
+	c.JSON(http.StatusOK, results)
+}
+
+func getAvgFlightDuration(c *gin.Context, collection useTables) {
+	flightDataCollection := collection.flightDataCollection
+
+	// Получаем параметры из query string
+	from := c.Query("from")
+	to := c.Query("to")
+
+	if from == "" || to == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Параметры from и to обязательны"})
+		return
+	}
+
+	ctx := context.Background()
+
+	// Парсим даты
+	start, err := time.Parse(time.RFC3339, from)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат from"})
+		return
+	}
+
+	end, err := time.Parse(time.RFC3339, to)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат to"})
+		return
+	}
+
+	fmt.Printf("📊 Получение средней длительности полетов с %s по %s\n", from, to)
+
+	// Создаем pipeline для агрегации
+	pipeline := mongo.Pipeline{
+		// Фильтруем по searchFields.dateTime
+		{{Key: "$match", Value: bson.M{
+			"searchFields.dateTime": bson.M{
+				"$gte": start,
+				"$lte": end,
+			},
+		}}},
+		// Фильтруем документы, где есть длительность полета
+		{{Key: "$match", Value: bson.M{
+			"shr.flightDuration": bson.M{"$gt": 0},
+		}}},
+		// Добавляем поле с взвешенной длительностью (длительность * количество дронов)
+		{{Key: "$addFields", Value: bson.M{
+			"weightedDuration": bson.M{
+				"$multiply": bson.A{
+					"$shr.flightDuration",
+					bson.M{
+						"$cond": bson.A{
+							bson.M{"$and": bson.A{
+								bson.M{"$ne": bson.A{"$shr.aircraftQuantity", nil}},
+								bson.M{"$gt": bson.A{"$shr.aircraftQuantity", 0}},
+							}},
+							"$shr.aircraftQuantity",
+							1, // если aircraftQuantity пустое или 0, используем 1
+						},
+					},
+				},
+			},
+		}}},
+		// Группируем по регионам и вычисляем среднее
+		{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: "$region"},
+			{Key: "avgDurationMinutes", Value: bson.M{"$avg": "$weightedDuration"}},
+		}}},
+		// Проектируем в нужный формат
+		{{Key: "$project", Value: bson.D{
+			{Key: "_id", Value: 0},
+			{Key: "region", Value: "$_id"},
+			{Key: "avgDurationMinutes", Value: bson.M{"$round": bson.A{"$avgDurationMinutes", 1}}}, // округляем до 1 знака
+		}}},
+		// Сортируем по региону
+		{{Key: "$sort", Value: bson.M{"region": 1}}},
+	}
+
+	cursor, err := flightDataCollection.Aggregate(ctx, pipeline)
+	if err != nil {
+		fmt.Printf("❌ Ошибка агрегации: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка выполнения запроса к базе данных"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var results []bson.M
+	if err := cursor.All(ctx, &results); err != nil {
+		fmt.Printf("❌ Ошибка декодирования: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка декодирования данных"})
+		return
+	}
+
+	fmt.Printf("📈 Найдено регионов: %d\n", len(results))
+
+	// Выводим результаты для отладки
+	/* 	for _, result := range results {
+		fmt.Printf("📊 Регион: %s, средняя длительность: %.1f минут\n",
+			result["region"], result["avgDurationMinutes"])
+	} */
+
+	c.JSON(http.StatusOK, results)
+}
+
+// Получение статистики по количеству полетов в группах по регионам
+func getFlightCount(c *gin.Context, collection useTables) {
+	flightDataCollection := collection.flightDataCollection
+
+	// Получаем параметры из query string
+	from := c.Query("from")
+	to := c.Query("to")
+
+	if from == "" || to == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Параметры from и to обязательны"})
+		return
+	}
+
+	ctx := context.Background()
+
+	// Парсим даты
+	start, err := time.Parse(time.RFC3339, from)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат from"})
+		return
+	}
+
+	end, err := time.Parse(time.RFC3339, to)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат to"})
+		return
+	}
+
+	fmt.Printf("📊 Получение статистики с %s по %s\n", from, to)
+
+	filter := bson.M{
+		"searchFields.dateTime": bson.M{
+			"$gte": start,
+			"$lte": end,
+		},
+	}
+
+	// Создаем pipeline для агрегации
+	pipeline := mongo.Pipeline{
+		// Фильтруем по дате и региону
+		{{Key: "$match", Value: filter}},
+		// Группируем по регионам
+		{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: "$region"},
+			{Key: "flightCount", Value: bson.D{{Key: "$sum", Value: 1}}},
+			{Key: "droneCount", Value: bson.D{
+				{Key: "$sum", Value: bson.D{
+					{Key: "$cond", Value: bson.A{
+						bson.D{{Key: "$eq", Value: bson.A{"$shr.aircraftQuantity", nil}}},
+						0,
+						bson.D{{Key: "$toInt", Value: "$shr.aircraftQuantity"}},
+					}},
+				}},
+			}}},
+		}},
+		// Проектируем в нужный формат
+		{{Key: "$project", Value: bson.D{
+			{Key: "_id", Value: 0},
+			{Key: "region", Value: "$_id"},
+			{Key: "flightCount", Value: 1},
+			{Key: "droneCount", Value: 1},
+		}}},
+	}
+
+	cursor, err := flightDataCollection.Aggregate(ctx, pipeline)
+	if err != nil {
+		fmt.Printf("❌ Ошибка агрегации: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка выполнения запроса к базе данных"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var results []bson.M
+	if err := cursor.All(ctx, &results); err != nil {
+		fmt.Printf("❌ Ошибка декодирования: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка декодирования данных"})
+		return
+	}
+
+	fmt.Printf("📈 Найдено регионов: %d\n", len(results))
+	c.JSON(http.StatusOK, results)
 }
 
 // Запрос для тепловой карты полетов
@@ -75,7 +357,7 @@ func getHeatmapData(c *gin.Context, collection useTables) {
 	var coordinates []map[string]float64
 	var noFoundCounter int
 	for _, result := range results {
-		var lat, lng float64
+		var lat, lon float64
 		found := false
 
 		// Пытаемся получить координаты из dep->coordinates (как объект с lat/lon)
@@ -84,10 +366,10 @@ func getHeatmapData(c *gin.Context, collection useTables) {
 				if latVal, ok := coords["lat"].(float64); ok {
 					lat = latVal
 				}
-				if lngVal, ok := coords["lon"].(float64); ok { // Обратите внимание: "lon", а не "lng"
-					lng = lngVal
+				if lonVal, ok := coords["lon"].(float64); ok { // Обратите внимание: "lon", а не "lng"
+					lon = lonVal
 				}
-				if lat != 0 || lng != 0 {
+				if lat != 0 || lon != 0 {
 					found = true
 				}
 			}
@@ -100,10 +382,10 @@ func getHeatmapData(c *gin.Context, collection useTables) {
 					if latVal, ok := coordsDep["lat"].(float64); ok {
 						lat = latVal
 					}
-					if lngVal, ok := coordsDep["lon"].(float64); ok {
-						lng = lngVal
+					if lonVal, ok := coordsDep["lon"].(float64); ok {
+						lon = lonVal
 					}
-					if lat != 0 || lng != 0 {
+					if lat != 0 || lon != 0 {
 						found = true
 					}
 				}
@@ -114,7 +396,7 @@ func getHeatmapData(c *gin.Context, collection useTables) {
 		if found {
 			coordinates = append(coordinates, map[string]float64{
 				"lat": lat,
-				"lng": lng, // Преобразуем lon в lng для ответа
+				"lon": lon,
 			})
 		} else {
 			noFoundCounter++
@@ -183,6 +465,15 @@ func uploadFiles(c *gin.Context, collection useTables) {
 
 	fmt.Println("=== НАЧАЛО ОБРАБОТКИ ДАННЫХ ДЛЯ MONGODB ===")
 
+	// Очищаем коллекцию flightData
+	ctx := context.Background()
+	_, err := flightDataCollection.DeleteMany(ctx, bson.M{})
+	if err != nil {
+		fmt.Printf("ошибка очистки коллекции flightData: %v", err)
+	}
+	fmt.Println("✅ Коллекция flightData очищена")
+	//Конец очистки УДАЛИТЬ ПОСЛЕ ОКОНЧАНИЯ РАЗРАБОТКИ
+
 	file, err := c.FormFile("excel_file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Файл не получен"})
@@ -211,13 +502,16 @@ func uploadFiles(c *gin.Context, collection useTables) {
 	}
 
 	firstSheet := sheets[0]
-	fmt.Printf("📊 Обрабатываем лист: %s\n", firstSheet)
+	fmt.Printf("🔄 Обрабатываем лист: %s\n", firstSheet)
 
 	rows, err := xlsxFile.GetRows(firstSheet)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка чтения строк"})
 		return
 	}
+
+	totalRow := len(rows) - 1
+	fmt.Printf("📊 Общее количество строк: %d\n", totalRow)
 
 	// Пропускаем первую строку (заголовок) и обрабатываем данные
 	var insertedCount int
@@ -226,13 +520,16 @@ func uploadFiles(c *gin.Context, collection useTables) {
 		flightData := parsing.CreateFlightData(i+1, row)
 
 		// Сохраняем в MongoDB
-		result, err := flightDataCollection.InsertOne(context.Background(), flightData)
+		_, err := flightDataCollection.InsertOne(context.Background(), flightData)
 		if err != nil {
 			log.Printf("❌ Ошибка сохранения строки %d: %v", i+1, err)
 			continue
 		}
 
-		fmt.Printf("✅ Строка %d сохранена с ID: %v\n", i+1, result.InsertedID)
+		if i%(totalRow/10) == 0 {
+			fmt.Printf("✅ Загрузка завершена на %d%%\n", i*10/(totalRow/10))
+		}
+
 		insertedCount++
 
 	}
@@ -301,7 +598,7 @@ func updateRegionList(collection useTables) {
 			fmt.Printf("ошибка вставки регионов: %v", err)
 		}
 
-		fmt.Printf("✅ В коллекцию regionList добавлено %d уникальных регионов\n", len(result.InsertedIDs))
+		fmt.Printf("📈 В коллекцию regionList добавлено %d уникальных регионов\n", len(result.InsertedIDs))
 	} else {
 		fmt.Println("ℹ️  Не найдено регионов для добавления")
 	}

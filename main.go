@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"log"
@@ -36,6 +37,7 @@ func main() {
 
 	port := ":8080"
 
+	fmt.Println("Listening and serving HTTP on :8080")
 	if err := router.Run(port); err != nil {
 		log.Fatal("❌ Ошибка запуска сервера:", err)
 	}

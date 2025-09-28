@@ -20,6 +20,10 @@ func ParseDate(dateStr, timeStr string) *time.Time {
 		panic(err)
 	}
 
+	if timeStr == "2400" {
+		timeStr = "2359"
+	}
+
 	// Парсим время
 	if timeStr != "" {
 		timeLayout := "1504" // формат hhmm
