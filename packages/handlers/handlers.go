@@ -9,6 +9,7 @@ import (
 	"project/packages/auth"
 	"project/packages/mongodb"
 	"project/packages/parsing"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,12 +37,361 @@ func RegisterRoutes(r *gin.Engine, client *mongo.Client) {
 	r.GET("/flight-count", func(c *gin.Context) { getFlightCount(c, tables) })
 	r.GET("/avg-flight-duration", func(c *gin.Context) { getAvgFlightDuration(c, tables) })
 	r.GET("/top-10", func(c *gin.Context) { getTop10Regions(c, tables) })
+	r.GET("/peak-hour", func(c *gin.Context) { getPeakHour(c, tables) })
+	r.GET("/region/yearly-stats", func(c *gin.Context) { getYearlyStats(c, tables) })
+	r.GET("/flights-table", func(c *gin.Context) { getFlightTable(c, tables) })
 
 	r.POST("/upload", auth.RequireRealmRole("admin"), func(c *gin.Context) {
 		uploadFiles(c, tables)
 		updateRegionList(tables)
 	})
 
+}
+
+func getFlightTable(c *gin.Context, collection useTables) {
+	flightDataCollection := collection.flightDataCollection
+
+	// Получаем параметры пагинации
+	page := c.DefaultQuery("page", "1")
+	limit := c.DefaultQuery("limit", "20")
+
+	pageInt, err := strconv.Atoi(page)
+	if err != nil || pageInt < 1 {
+		pageInt = 1
+	}
+
+	limitInt, err := strconv.Atoi(limit)
+	if err != nil || limitInt < 1 {
+		limitInt = 50
+	}
+	if limitInt > 1000 {
+		limitInt = 1000
+	}
+
+	// Вычисляем skip
+	skip := (pageInt - 1) * limitInt
+
+	ctx := context.Background()
+
+	fmt.Printf("📊 Получение таблицы полетов - страница %d, лимит %d\n", pageInt, limitInt)
+
+	// Создаем pipeline для агрегации
+	pipeline := mongo.Pipeline{
+		// Проекция нужных полей
+		{{Key: "$project", Value: bson.M{
+			"region":           1,
+			"sid":              "$shr.sid",
+			"aircraftIndex":    "$shr.aircraftIndex",
+			"aircraftType":     "$shr.aircraftType",
+			"aircraftQuantity": "$shr.aircraftQuantity",
+			"dateDep":          "$searchFields.dateTime",                        // используем searchFields.dateTime как dateDep
+			"dateArr":          bson.M{"$ifNull": bson.A{"$arr.dateTime", nil}}, // arr.dateTime как dateArr
+			"flightDuration":   "$shr.flightDuration",
+			// Координаты вылета - coalesce(dep.coordinates, shr.coordinatesDep)
+			"coordinatesDep": bson.M{
+				"$cond": bson.M{
+					"if": bson.M{"$and": bson.A{
+						bson.M{"$ne": bson.A{"$dep.coordinates", nil}},
+					}},
+					"then": bson.M{
+						"$concat": bson.A{
+							bson.M{"$toString": "$dep.coordinates.lat"},
+							" ",
+							bson.M{"$toString": "$dep.coordinates.lon"},
+						},
+					},
+					"else": bson.M{
+						"$cond": bson.M{
+							"if": bson.M{"$and": bson.A{
+								bson.M{"$ne": bson.A{"$shr.coordinatesDep", nil}},
+							}},
+							"then": bson.M{
+								"$concat": bson.A{
+									bson.M{"$toString": "$shr.coordinatesDep.lat"},
+									" ",
+									bson.M{"$toString": "$shr.coordinatesDep.lon"},
+								},
+							},
+							"else": "",
+						},
+					},
+				},
+			},
+			// Координаты прилета - coalesce(arr.coordinates, shr.coordinatesArr)
+			"coordinatesArr": bson.M{
+				"$cond": bson.M{
+					"if": bson.M{"$and": bson.A{
+						bson.M{"$ne": bson.A{"$arr.coordinates", nil}},
+					}},
+					"then": bson.M{
+						"$concat": bson.A{
+							bson.M{"$toString": "$arr.coordinates.lat"},
+							" ",
+							bson.M{"$toString": "$arr.coordinates.lon"},
+						},
+					},
+					"else": bson.M{
+						"$cond": bson.M{
+							"if": bson.M{"$and": bson.A{
+								bson.M{"$ne": bson.A{"$shr.coordinatesArr", nil}},
+							}},
+							"then": bson.M{
+								"$concat": bson.A{
+									bson.M{"$toString": "$shr.coordinatesArr.lat"},
+									" ",
+									bson.M{"$toString": "$shr.coordinatesArr.lon"},
+								},
+							},
+							"else": "",
+						},
+					},
+				},
+			},
+			"rawText": "$shr.rawText",
+		}}},
+		// Сортировка по дате вылета (новые сначала)
+		{{Key: "$sort", Value: bson.M{"sid": 1}}},
+		// Пагинация
+		{{Key: "$skip", Value: skip}},
+		{{Key: "$limit", Value: limitInt}},
+	}
+
+	cursor, err := flightDataCollection.Aggregate(ctx, pipeline)
+	if err != nil {
+		fmt.Printf("❌ Ошибка агрегации: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка выполнения запроса к базе данных"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var results []bson.M
+	if err := cursor.All(ctx, &results); err != nil {
+		fmt.Printf("❌ Ошибка декодирования: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка декодирования данных"})
+		return
+	}
+
+	// Получаем общее количество для метаданных
+	totalCount, err := flightDataCollection.CountDocuments(ctx, bson.M{})
+	if err != nil {
+		fmt.Printf("❌ Ошибка подсчета общего количества: %v\n", err)
+		totalCount = 0
+	}
+
+	fmt.Printf("📈 Получено %d записей из %d (страница %d)\n", len(results), totalCount, pageInt)
+
+	// Формируем ответ с метаданными пагинации
+	response := bson.M{
+		"data": results,
+		"pagination": bson.M{
+			"page":       pageInt,
+			"limit":      limitInt,
+			"total":      totalCount,
+			"totalPages": (totalCount + int64(limitInt) - 1) / int64(limitInt),
+		},
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func getYearlyStats(c *gin.Context, collection useTables) {
+	flightDataCollection := collection.flightDataCollection
+
+	// Получаем параметры из query string
+	region := c.Query("region")
+	from := c.Query("from")
+	to := c.Query("to")
+
+	if region == "" || from == "" || to == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Параметры region, from и to обязательны"})
+		return
+	}
+
+	ctx := context.Background()
+
+	// Парсим даты
+	start, err := time.Parse(time.RFC3339, from)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат from"})
+		return
+	}
+
+	end, err := time.Parse(time.RFC3339, to)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат to"})
+		return
+	}
+
+	// Нормализуем даты (отбрасываем время)
+	startDate := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, start.Location())
+	endDate := time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, end.Location())
+
+	fmt.Printf("📅 Получение статистики по дням для региона '%s' с %s по %s\n",
+		region, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+
+	// Создаем pipeline для агрегации
+	pipeline := mongo.Pipeline{
+		// Фильтруем по региону и дате
+		{{Key: "$match", Value: bson.M{
+			"region": region,
+			"searchFields.dateTime": bson.M{
+				"$gte": startDate,
+				"$lte": endDate.Add(24*time.Hour - time.Second),
+			},
+		}}},
+		// Извлекаем дату (без времени)
+		{{Key: "$project", Value: bson.M{
+			"date": bson.M{
+				"$dateToString": bson.M{
+					"format": "%Y-%m-%d",
+					"date":   "$searchFields.dateTime",
+				},
+			},
+		}}},
+		// Группируем по дате
+		{{Key: "$group", Value: bson.M{
+			"_id":         "$date",
+			"flightCount": bson.M{"$sum": 1},
+		}}},
+		// Проектируем в нужный формат
+		{{Key: "$project", Value: bson.M{
+			"_id":         0,
+			"date":        "$_id",
+			"flightCount": 1,
+		}}},
+		// Сортируем по дате
+		{{Key: "$sort", Value: bson.M{"date": 1}}},
+	}
+
+	cursor, err := flightDataCollection.Aggregate(ctx, pipeline)
+	if err != nil {
+		fmt.Printf("❌ Ошибка агрегации: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка выполнения запроса к базе данных"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var aggResults []bson.M
+	if err := cursor.All(ctx, &aggResults); err != nil {
+		fmt.Printf("❌ Ошибка декодирования: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка декодирования данных"})
+		return
+	}
+
+	// Создаем мапу для быстрого доступа к результатам агрегации
+	resultMap := make(map[string]int)
+	for _, result := range aggResults {
+		if date, ok := result["date"].(string); ok {
+			if flightCount, ok := result["flightCount"].(int32); ok {
+				resultMap[date] = int(flightCount)
+			}
+		}
+	}
+
+	// Генерируем полный список дней в диапазоне
+	var fullResults []bson.M
+	for current := startDate; !current.After(endDate); current = current.AddDate(0, 0, 1) {
+		dateStr := current.Format("2006-01-02")
+
+		flightCount := 0
+		if count, exists := resultMap[dateStr]; exists {
+			flightCount = count
+		}
+
+		fullResults = append(fullResults, bson.M{
+			"date":        dateStr,
+			"flightCount": flightCount,
+		})
+	}
+
+	fmt.Printf("📈 Статистика по дням: найдено %d дней с активностью из %d дней в диапазоне\n",
+		len(aggResults), len(fullResults))
+
+	c.JSON(http.StatusOK, fullResults)
+}
+
+func getPeakHour(c *gin.Context, collection useTables) {
+	flightDataCollection := collection.flightDataCollection
+
+	// Получаем параметры из query string
+	region := c.Query("region")
+	date := c.Query("date")
+
+	if region == "" || date == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Параметры region и date обязательны"})
+		return
+	}
+
+	// Парсим дату
+	targetDate, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат date. Используйте YYYY-MM-DD"})
+		return
+	}
+
+	// Вычисляем временной диапазон для целевого дня
+	startOfDay := time.Date(targetDate.Year(), targetDate.Month(), targetDate.Day(), 0, 0, 0, 0, time.UTC)
+	endOfDay := startOfDay.Add(24*time.Hour - time.Second)
+
+	ctx := context.Background()
+
+	fmt.Printf("⏰ Получение статистики по часам для региона '%s' за %s\n", region, date)
+
+	// Создаем pipeline для агрегации
+	pipeline := mongo.Pipeline{
+		// Фильтруем по региону и дате
+		{{Key: "$match", Value: bson.M{
+			"region": region,
+			"searchFields.dateTime": bson.M{
+				"$gte": startOfDay,
+				"$lte": endOfDay,
+			},
+		}}},
+		// Извлекаем час из datetime
+		{{Key: "$project", Value: bson.M{
+			"hour":             bson.M{"$hour": "$searchFields.dateTime"},
+			"aircraftQuantity": "$shr.aircraftQuantity",
+		}}},
+		// Группируем по часам
+		{{Key: "$group", Value: bson.M{
+			"_id":         "$hour",
+			"flightCount": bson.M{"$sum": 1},
+			"droneCount":  bson.M{"$sum": "$aircraftQuantity"},
+		}}},
+		// Форматируем час в строку
+		{{Key: "$project", Value: bson.M{
+			"_id": 0,
+			"hour": bson.M{
+				"$concat": bson.A{
+					bson.M{"$toString": "$_id"},
+					":00",
+				},
+			},
+			"flightCount": 1,
+			"droneCount":  1,
+		}}},
+		// Сортируем по часу
+		{{Key: "$sort", Value: bson.M{"hour": 1}}},
+	}
+
+	cursor, err := flightDataCollection.Aggregate(ctx, pipeline)
+	if err != nil {
+		fmt.Printf("❌ Ошибка агрегации: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка выполнения запроса к базе данных"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var results []bson.M
+	if err := cursor.All(ctx, &results); err != nil {
+		fmt.Printf("❌ Ошибка декодирования: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка декодирования данных"})
+		return
+	}
+
+	fmt.Printf("📈 Найдено часов с активностью: %d\n", len(results))
+
+	c.JSON(http.StatusOK, results)
 }
 
 func getTop10Regions(c *gin.Context, collection useTables) {
@@ -458,6 +808,41 @@ func healthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "pong"})
 }
 
+// getExistingSIDs возвращает множество существующих SID из базы данных
+func getExistingSIDs(collection *mongo.Collection) (map[int]bool, error) {
+	ctx := context.Background()
+	existingSIDs := make(map[int]bool)
+
+	// Проекция только поля SID для оптимизации
+	opts := options.Find().SetProjection(bson.M{"shr.sid": 1})
+
+	cursor, err := collection.Find(ctx, bson.M{"shr.sid": bson.M{"$ne": nil}}, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	// Структура для временного хранения результатов
+	var results []struct {
+		SHR struct {
+			SID *int `bson:"sid"`
+		} `bson:"shr"`
+	}
+
+	if err := cursor.All(ctx, &results); err != nil {
+		return nil, err
+	}
+
+	// Заполняем множество SID
+	for _, result := range results {
+		if result.SHR.SID != nil {
+			existingSIDs[*result.SHR.SID] = true
+		}
+	}
+
+	return existingSIDs, nil
+}
+
 // Парсинг и загрузка файла в базу
 func uploadFiles(c *gin.Context, collection useTables) {
 
@@ -465,14 +850,14 @@ func uploadFiles(c *gin.Context, collection useTables) {
 
 	fmt.Println("=== НАЧАЛО ОБРАБОТКИ ДАННЫХ ДЛЯ MONGODB ===")
 
-	// Очищаем коллекцию flightData
-	ctx := context.Background()
-	_, err := flightDataCollection.DeleteMany(ctx, bson.M{})
-	if err != nil {
-		fmt.Printf("ошибка очистки коллекции flightData: %v", err)
-	}
-	fmt.Println("✅ Коллекция flightData очищена")
-	//Конец очистки УДАЛИТЬ ПОСЛЕ ОКОНЧАНИЯ РАЗРАБОТКИ
+	/* 	// Очищаем коллекцию flightData
+	   	ctx := context.Background()
+	   	_, err := flightDataCollection.DeleteMany(ctx, bson.M{})
+	   	if err != nil {
+	   		fmt.Printf("ошибка очистки коллекции flightData: %v", err)
+	   	}
+	   	fmt.Println("✅ Коллекция flightData очищена")
+	   	//Конец очистки УДАЛИТЬ ПОСЛЕ ОКОНЧАНИЯ РАЗРАБОТКИ */
 
 	file, err := c.FormFile("excel_file")
 	if err != nil {
@@ -513,11 +898,32 @@ func uploadFiles(c *gin.Context, collection useTables) {
 	totalRow := len(rows) - 1
 	fmt.Printf("📊 Общее количество строк: %d\n", totalRow)
 
+	// Получаем существующие SID из базы для проверки уникальности
+	existingSIDs, err := getExistingSIDs(flightDataCollection)
+	if err != nil {
+		fmt.Printf("❌ Ошибка получения существующих SID: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка проверки уникальности данных"})
+		return
+	}
+
+	fmt.Printf("🔍 Найдено %d существующих SID в базе\n", len(existingSIDs))
+
 	// Пропускаем первую строку (заголовок) и обрабатываем данные
 	var insertedCount int
 	for i, row := range rows[1:] {
 
 		flightData := parsing.CreateFlightData(i+1, row)
+
+		if i%(totalRow/10) == 0 {
+			fmt.Printf("✅ Обработка завершена на %d%%\n", i*10/(totalRow/10))
+		}
+
+		insertedCount++
+
+		sid := *flightData.SHRData.SID
+		if _, exists := existingSIDs[sid]; exists {
+			continue
+		}
 
 		// Сохраняем в MongoDB
 		_, err := flightDataCollection.InsertOne(context.Background(), flightData)
@@ -526,11 +932,7 @@ func uploadFiles(c *gin.Context, collection useTables) {
 			continue
 		}
 
-		if i%(totalRow/10) == 0 {
-			fmt.Printf("✅ Загрузка завершена на %d%%\n", i*10/(totalRow/10))
-		}
-
-		insertedCount++
+		existingSIDs[sid] = true
 
 	}
 

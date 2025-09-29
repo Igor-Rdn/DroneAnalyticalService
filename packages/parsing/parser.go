@@ -64,11 +64,11 @@ type ArrivalData struct {
 
 // KeyFields - ключевые поля для индексации и поиска
 type SearchField struct {
-	SID      *int       `bson:"sid" json:"sid"`
-	Region   string     `bson:"region" json:"region"`
-	DateTime *time.Time `bson:"dateTime" json:"dateTime"`
-	//DateTimeDep *time.Time `bson:"DateTimeDep" json:"DateTimeDep"`
-	//DateTimeArr *time.Time `bson:"DateTimeArr" json:"DateTimeArr"`
+	SID         *int       `bson:"sid" json:"sid"`
+	Region      string     `bson:"region" json:"region"`
+	DateTime    *time.Time `bson:"dateTime" json:"dateTime"`
+	DepDatetime *time.Time `bson:"depDatetime" json:"depDatetime"`
+	ArrDatetime *time.Time `bson:"arrDatetime" json:"arrDatetime"`
 }
 
 // Безопасное получение элемента из массива(если в какой то строке exel не заполнен столбец)
@@ -120,15 +120,23 @@ func CreateFlightData(rowNum int, row []string) FlightData {
 
 	// Создаем ключевые поля для индексации
 	searchField := SearchField{
-		SID:      shrData.SID,
-		Region:   region,
-		DateTime: Coalesce(depData.DateTime, datetime.ParseDate(shrData.Date, shrData.TimeDep), datetime.ParseDate(shrData.Date, shrData.TimeArr)),
+		SID:         shrData.SID,
+		Region:      region,
+		DateTime:    Coalesce(depData.DateTime, datetime.ParseDate(shrData.Date, shrData.TimeDep), datetime.ParseDate(shrData.Date, shrData.TimeArr)),
+		DepDatetime: Coalesce(depData.DateTime, datetime.ParseDate(shrData.Date, shrData.TimeDep)),
+		ArrDatetime: Coalesce(arrData.DateTime, datetime.ParseDate(shrData.Date, shrData.TimeArr)),
+	}
+
+	if searchField.ArrDatetime != nil && searchField.DepDatetime != nil {
+		if searchField.ArrDatetime.Before(*searchField.DepDatetime) {
+			searchField.ArrDatetime = nil
+		}
 	}
 
 	//Считаем длительность полета
-	depDatetime := Coalesce(depData.DateTime, datetime.ParseDate(shrData.Date, shrData.TimeDep))
+	//depDatetime := Coalesce(depData.DateTime, datetime.ParseDate(shrData.Date, shrData.TimeDep))
 	arrDatetime := Coalesce(arrData.DateTime, datetime.ParseDate(shrData.Date, shrData.TimeArr))
-	duration := arrDatetime.Sub(*depDatetime)
+	duration := arrDatetime.Sub(*searchField.DepDatetime)
 	shrData.FlightDuration = parseFloat(duration.Minutes())
 	if *shrData.FlightDuration < 0 {
 		shrData.FlightDuration = nil
