@@ -20,6 +20,7 @@ WORKDIR /app
 
 # Копируем бинарник из builder
 COPY --from=builder /app/main .
+COPY --from=builder /app/geojsonFiles ./geojsonFiles
 
 # Указываем порт
 EXPOSE 8080

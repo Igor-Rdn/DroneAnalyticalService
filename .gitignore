@@ -1,1 +1,7 @@
 data
+
+.vscode/*
+.idea/*
+
+.env
+realm-export.json
